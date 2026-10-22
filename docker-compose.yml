@@ -1,0 +1,7 @@
+services:
+  tabpy:
+    build: ./tabpy
+    env_file: .env
+    ports:
+      - "9004:9004"
+    restart: unless-stopped
