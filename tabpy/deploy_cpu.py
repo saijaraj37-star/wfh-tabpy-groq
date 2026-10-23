@@ -1,7 +1,4 @@
 import os
-import json
-import time
-import requests
 from tabpy.tabpy_tools.client import Client
 
 
@@ -31,23 +28,66 @@ if os.path.isfile(ENV_FILE):
 # 2. AI-based complete system assessment (Google Gemini)
 #    Company System  -> Approved (no AI check)
 #    Personal System -> Full AI check based on team work
+#
+#    Optional .env settings (all have defaults):
+#      AI_TIME_BUDGET    seconds one Tableau call may spend on Gemini (default 25)
+#      AI_READ_TIMEOUT   max seconds to wait for one Gemini reply (default 40)
+#      AI_THINKING_LEVEL e.g. "low" (Gemini 3) - only sent if set
+#      AI_THINKING_BUDGET e.g. "0" (Gemini 2.5) - only sent if set
+#      CHECK_CACHE_FILE  path of the on-disk result cache
 # --------------------------------------------------
 def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
+    # Imports inside the function so TabPy serializes them reliably
+    import os
+    import json
+    import time
+    import requests
+
+    start = time.time()
+
     model = os.environ["AI_MODEL"]
     api_key = os.environ["AI_API_KEY"]
 
-    # Optional pause (seconds) after each real AI call, to stay under the
-    # free-tier per-minute limit. Set AI_CALL_DELAY in .env if needed.
-    try:
-        call_delay = float(os.environ.get("AI_CALL_DELAY", "0"))
-    except ValueError:
-        call_delay = 0
+    def env_float(name, default):
+        try:
+            return float(os.environ.get(name, default))
+        except ValueError:
+            return float(default)
+
+    time_budget = env_float("AI_TIME_BUDGET", 25)
+    max_read_timeout = env_float("AI_READ_TIMEOUT", 40)
+    deadline = start + time_budget
+
+    cache_file = os.environ.get(
+        "CHECK_CACHE_FILE",
+        os.path.join(os.path.expanduser("~"), "check_system_cache.json"),
+    )
 
     gemini_url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         + model
         + ":generateContent"
     )
+
+    # ---------------- disk cache (successful results only) ----------------
+    def load_cache():
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def save_cache(data):
+        try:
+            tmp = cache_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, cache_file)
+        except Exception as exc:
+            print("CACHE WRITE ERROR:", repr(exc))
+
+    cache = load_cache()
 
     system_instruction = (
         "You are a careful IT hardware assessor. "
@@ -164,10 +204,34 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
     and actual prices depend on the laptop model and location.
     """
 
+    # ---------------- Gemini call: fail fast, respect the deadline ----------------
     def ask_json(prompt):
+        generation_config = {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+            "maxOutputTokens": 800,
+        }
+
+        thinking = {}
+        level = os.environ.get("AI_THINKING_LEVEL", "").strip()
+        budget = os.environ.get("AI_THINKING_BUDGET", "").strip()
+        if level:
+            thinking["thinkingLevel"] = level
+        elif budget:
+            try:
+                thinking["thinkingBudget"] = int(budget)
+            except ValueError:
+                pass
+        if thinking:
+            generation_config["thinkingConfig"] = thinking
+
         last_error = None
 
-        for attempt in range(4):
+        for attempt in range(2):
+            remaining = deadline - time.time()
+            if remaining < 5:
+                raise TimeoutError("time budget used up")
+
             try:
                 response = requests.post(
                     gemini_url,
@@ -180,36 +244,27 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
                             "parts": [{"text": system_instruction}]
                         },
                         "contents": [
-                            {
-                                "role": "user",
-                                "parts": [{"text": prompt}],
-                            }
+                            {"role": "user", "parts": [{"text": prompt}]}
                         ],
-                        "generationConfig": {
-                            "temperature": 0,
-                            "responseMimeType": "application/json",
-                        },
+                        "generationConfig": generation_config,
                     },
-                    timeout=60,
+                    timeout=(5, min(max_read_timeout, remaining)),
                 )
 
-                # Rate limit (429) or temporary overload (503): wait and retry
-                if response.status_code in (429, 503):
-                    last_error = "Gemini rate limit/overload (" + str(
-                        response.status_code
-                    ) + ")"
+                # 429 = quota/rate limit: retrying right away will not help
+                if response.status_code == 429:
+                    raise RuntimeError("Gemini quota/rate limit (429)")
 
-                    if attempt < 3:
-                        time.sleep(10 * (attempt + 1))
-                        continue
-
-                    raise RuntimeError(last_error)
+                # 503 = Google overloaded: one quick retry only
+                if response.status_code == 503:
+                    last_error = "Gemini overloaded (503)"
+                    time.sleep(2)
+                    continue
 
                 response.raise_for_status()
 
                 body = response.json()
                 candidates = body.get("candidates") or []
-
                 if not candidates:
                     raise RuntimeError(
                         "Gemini returned no candidates: "
@@ -218,36 +273,21 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
 
                 parts = candidates[0].get("content", {}).get("parts") or []
                 content = "".join(part.get("text", "") for part in parts)
-
-                # Safety net in case the model wraps JSON in code fences
                 content = (
                     content.replace("```json", "").replace("```", "").strip()
                 )
-
                 return json.loads(content)
 
+            except requests.exceptions.Timeout as exc:
+                last_error = "Gemini timeout: " + str(exc)
+                break
             except Exception as exc:
                 last_error = str(exc)
-
-                status_code = getattr(
-                    getattr(exc, "response", None),
-                    "status_code",
-                    None,
-                )
-
-                if (
-                    status_code is not None
-                    and 400 <= status_code < 500
-                    and status_code != 429
-                ):
-                    raise
-
-                if attempt == 3:
-                    raise RuntimeError(
-                        "Gemini request failed: " + last_error
-                    ) from exc
-
-                time.sleep(2 * (attempt + 1))
+                if "429" in last_error:
+                    break
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status is not None and 400 <= status < 500:
+                    break
 
         raise RuntimeError("Gemini request failed: " + str(last_error))
 
@@ -255,9 +295,14 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
         # Tableau can send None for NULL values
         return "" if value is None else str(value).strip()
 
-    # Cache avoids repeating identical assessments within one invocation.
-    cache = {}
+    pending_text = (
+        "⏳ PENDING\n\n"
+        "📌 Reason: AI assessment is still in progress. "
+        "Please refresh the dashboard in a minute."
+    )
+
     output = []
+    cache_changed = False
 
     for cpu, ram, storage, internet, system_type, team, owner in zip(
         cpus, rams, storages, nets, sys_types, teams, system_owners
@@ -278,11 +323,25 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
             )
             continue
 
-        # ---- Personal system: full AI check based on team work ----
-        key = (cpu, ram, storage, internet, system_type, team_key)
+        # ---- Personal system: cached or full AI check ----
+        key = "||".join(
+            [
+                clean(cpu),
+                clean(ram),
+                clean(storage),
+                clean(internet),
+                clean(system_type),
+                team_key,
+            ]
+        )
 
         if key in cache:
             output.append(cache[key])
+            continue
+
+        # Out of time for this Tableau call: leave for the next refresh
+        if time.time() > deadline - 5:
+            output.append(pending_text)
             continue
 
         configuration = {
@@ -347,6 +406,8 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
         }}
         """
 
+        failed = False
+
         try:
             data = ask_json(prompt)
 
@@ -380,19 +441,25 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
                 result = "\n".join(parts)
 
             else:
-                # Unknown output must never be silently approved.
+                failed = True
                 result = (
                     "⚠️ MANUAL REVIEW\n\n"
                     "📌 Reason: AI returned an invalid decision. "
                     "Please verify the configuration manually."
                 )
 
+        except TimeoutError:
+            # Budget ran out mid-loop: not an error, just try again next refresh
+            output.append(pending_text)
+            continue
+
         except Exception as exc:
             print("AI ERROR:", repr(exc))
+            failed = True
             result = (
                 "⚠️ MANUAL REVIEW\n\n"
-                "📌 Reason: AI assessment failed. "
-                "Check the Gemini API key, model name and logs."
+                "📌 Reason: AI assessment failed (temporary). "
+                "Refresh the dashboard to retry."
             )
 
         # Keep line breaks, but clean extra spaces and pipe characters per line
@@ -400,11 +467,13 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
             " ".join(line.replace("|", "/").split()) for line in result.split("\n")
         )
 
-        cache[key] = result
         output.append(result)
 
-        if call_delay > 0:
-            time.sleep(call_delay)
+        # Cache only successful AI answers, never failures
+        if not failed:
+            cache[key] = result
+            cache_changed = True
+            save_cache(cache)
 
     return output
 
