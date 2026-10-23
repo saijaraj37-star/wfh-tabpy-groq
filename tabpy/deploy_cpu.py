@@ -174,7 +174,6 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
                         "response_format": {"type": "json_object"},
                         "temperature": 0,
                     },
-                    timeout=60,
                 )
 
                 if response.status_code == 429:
