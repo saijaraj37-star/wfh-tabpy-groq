@@ -27,20 +27,30 @@ if os.path.isfile(ENV_FILE):
 # --------------------------------------------------
 # 2. AI-based complete system assessment (Google Gemini)
 #    Company System  -> Approved (no AI check)
-#    Personal System -> Full AI check based on team work
+#    Personal System -> AI check based on team work
 #
-#    Optional .env settings (all have defaults):
-#      AI_TIME_BUDGET    seconds one Tableau call may spend on Gemini (default 25)
-#      AI_READ_TIMEOUT   max seconds to wait for one Gemini reply (default 40)
-#      AI_THINKING_LEVEL e.g. "low" (Gemini 3) - only sent if set
-#      AI_THINKING_BUDGET e.g. "0" (Gemini 2.5) - only sent if set
-#      CHECK_CACHE_FILE  path of the on-disk result cache
+#    How it avoids Tableau timeouts:
+#    - Gemini calls run in BACKGROUND threads inside the TabPy process.
+#    - By default Tableau waits until every row is finished (AI_WAIT=0).
+#    - Finished answers are saved in a cache file, so the next refresh
+#      returns instantly. Unfinished rows show "PENDING".
+#
+#    Optional .env settings:
+#      AI_WAIT=0               0 = wait until all done; else max seconds
+#      AI_READ_TIMEOUT=120     max seconds for one Gemini reply (background)
+#      AI_PARALLEL=2           parallel Gemini calls (keep low for free tier)
+#      AI_THINKING_LEVEL=low   only sent if set (Gemini 3 style models)
+#      AI_THINKING_BUDGET=0    only sent if set (Gemini 2.5 style models)
+#      CHECK_CACHE_FILE=...    path of the cache file
 # --------------------------------------------------
 def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
     # Imports inside the function so TabPy serializes them reliably
     import os
+    import sys
     import json
     import time
+    import types
+    import threading
     import requests
 
     start = time.time()
@@ -54,9 +64,9 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
         except ValueError:
             return float(default)
 
-    time_budget = env_float("AI_TIME_BUDGET", 25)
-    max_read_timeout = env_float("AI_READ_TIMEOUT", 40)
-    deadline = start + time_budget
+    wait_seconds = env_float("AI_WAIT", 0)  # 0 = wait until all done
+    read_timeout = env_float("AI_READ_TIMEOUT", 120)
+    parallel = max(1, int(env_float("AI_PARALLEL", 2)))
 
     cache_file = os.environ.get(
         "CHECK_CACHE_FILE",
@@ -69,25 +79,42 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
         + ":generateContent"
     )
 
-    # ---------------- disk cache (successful results only) ----------------
+    # ---------- shared state that survives between Tableau calls ----------
+    state = sys.modules.get("_check_system_state")
+    if state is None:
+        state = types.ModuleType("_check_system_state")
+        state.lock = threading.Lock()
+        state.inflight = set()
+        state.sem = threading.Semaphore(parallel)
+        sys.modules["_check_system_state"] = state
+
+    # ---------- disk cache (successful AI answers only) ----------
     def load_cache():
-        try:
-            with open(cache_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
+        with state.lock:
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
 
-    def save_cache(data):
-        try:
-            tmp = cache_file + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False)
-            os.replace(tmp, cache_file)
-        except Exception as exc:
-            print("CACHE WRITE ERROR:", repr(exc))
-
-    cache = load_cache()
+    def cache_put(key, value):
+        with state.lock:
+            try:
+                try:
+                    with open(cache_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if not isinstance(data, dict):
+                        data = {}
+                except Exception:
+                    data = {}
+                data[key] = value
+                tmp = cache_file + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False)
+                os.replace(tmp, cache_file)
+            except Exception as exc:
+                print("CACHE WRITE ERROR:", repr(exc))
 
     system_instruction = (
         "You are a careful IT hardware assessor. "
@@ -204,7 +231,11 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
     and actual prices depend on the laptop model and location.
     """
 
-    # ---------------- Gemini call: fail fast, respect the deadline ----------------
+    def clean(value):
+        # Tableau can send None for NULL values
+        return "" if value is None else str(value).strip()
+
+    # ---------- Gemini call (runs in background threads) ----------
     def ask_json(prompt):
         generation_config = {
             "temperature": 0,
@@ -227,11 +258,7 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
 
         last_error = None
 
-        for attempt in range(2):
-            remaining = deadline - time.time()
-            if remaining < 5:
-                raise TimeoutError("time budget used up")
-
+        for attempt in range(4):
             try:
                 response = requests.post(
                     gemini_url,
@@ -248,18 +275,22 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
                         ],
                         "generationConfig": generation_config,
                     },
-                    timeout=(5, min(max_read_timeout, remaining)),
+                    timeout=(10, read_timeout),
                 )
 
-                # 429 = quota/rate limit: retrying right away will not help
-                if response.status_code == 429:
-                    raise RuntimeError("Gemini quota/rate limit (429)")
-
-                # 503 = Google overloaded: one quick retry only
-                if response.status_code == 503:
-                    last_error = "Gemini overloaded (503)"
-                    time.sleep(2)
+                if response.status_code in (429, 503):
+                    last_error = "Gemini busy (" + str(response.status_code) + ")"
+                    time.sleep(15 * (attempt + 1))
                     continue
+
+                if 400 <= response.status_code < 500:
+                    # Bad key / bad model / bad request: retrying will not help
+                    raise RuntimeError(
+                        "Gemini HTTP "
+                        + str(response.status_code)
+                        + ": "
+                        + response.text[:300]
+                    )
 
                 response.raise_for_status()
 
@@ -278,85 +309,74 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
                 )
                 return json.loads(content)
 
-            except requests.exceptions.Timeout as exc:
-                last_error = "Gemini timeout: " + str(exc)
-                break
-            except Exception as exc:
-                last_error = str(exc)
-                if "429" in last_error:
-                    break
-                status = getattr(getattr(exc, "response", None), "status_code", None)
-                if status is not None and 400 <= status < 500:
-                    break
+            except requests.exceptions.RequestException as exc:
+                last_error = repr(exc)
+                time.sleep(5 * (attempt + 1))
+            except ValueError as exc:
+                # JSON parse problem: retry once more
+                last_error = "Bad JSON from Gemini: " + repr(exc)
+                time.sleep(2)
 
         raise RuntimeError("Gemini request failed: " + str(last_error))
 
-    def clean(value):
-        # Tableau can send None for NULL values
-        return "" if value is None else str(value).strip()
+    def format_result(data, team_label):
+        """Return final text, or None if the AI answer is unusable."""
+        decision = str(data.get("decision", "")).strip().upper()
 
-    pending_text = (
-        "⏳ PENDING\n\n"
-        "📌 Reason: AI assessment is still in progress. "
-        "Please refresh the dashboard in a minute."
-    )
+        if decision == "APPROVED":
+            text = "Approved"
 
-    output = []
-    cache_changed = False
+        elif decision in ("NOT SUITABLE", "MANUAL REVIEW"):
+            reason = str(data.get("reason", "")).strip()
+            impact = str(data.get("impact", "")).strip()
+            upgrades = str(data.get("upgrades", "")).strip()
+            cost = str(data.get("estimated_cost", "")).strip()
+            missing = str(data.get("missing_information", "")).strip()
 
-    for cpu, ram, storage, internet, system_type, team, owner in zip(
-        cpus, rams, storages, nets, sys_types, teams, system_owners
-    ):
-        owner_key = clean(owner).lower()
-        team_key = clean(team).upper()
+            icon = "❌" if decision == "NOT SUITABLE" else "⚠️"
 
-        # ---- Company system: no check needed, always approved ----
-        if owner_key == "company system":
-            output.append("Approved")
-            continue
-
-        # ---- Unknown owner value: never silently approve ----
-        if owner_key != "personal system":
-            output.append(
-                "⚠️ MANUAL REVIEW\n\n"
-                "📌 Reason: System type (Personal/Company) is missing or invalid."
-            )
-            continue
-
-        # ---- Personal system: cached or full AI check ----
-        key = "||".join(
-            [
-                clean(cpu),
-                clean(ram),
-                clean(storage),
-                clean(internet),
-                clean(system_type),
-                team_key,
+            parts = [
+                icon + " " + decision + " - Team: " + team_label,
+                "",
+                "📌 Reason: " + (reason or "AI did not provide a reason."),
+                "💼 Work Impact: " + (impact or "Impact needs verification."),
+                "🔧 Recommended Upgrade: " + (upgrades or "Needs assessment."),
+                "💰 Approx Cost: " + (cost or "Cannot estimate"),
             ]
+
+            if missing and missing.lower() not in ("none", "n/a"):
+                parts.append("🔍 Please Verify: " + missing)
+
+            text = "\n".join(parts)
+
+        else:
+            return None
+
+        # Clean extra spaces and pipe characters per line
+        return "\n".join(
+            " ".join(line.replace("|", "/").split()) for line in text.split("\n")
         )
 
-        if key in cache:
-            output.append(cache[key])
-            continue
+    def worker(key, prompt, team_label):
+        state.sem.acquire()
+        try:
+            data = ask_json(prompt)
+            result = format_result(data, team_label)
+            if result is not None:
+                cache_put(key, result)
+            else:
+                print("AI ERROR: invalid decision for", key)
+        except Exception as exc:
+            print("AI ERROR:", repr(exc))
+        finally:
+            state.sem.release()
+            with state.lock:
+                state.inflight.discard(key)
 
-        # Out of time for this Tableau call: leave for the next refresh
-        if time.time() > deadline - 5:
-            output.append(pending_text)
-            continue
-
-        configuration = {
-            "CPU": str(cpu),
-            "RAM": str(ram),
-            "Storage": str(storage),
-            "Internet": str(internet),
-            "System type": str(system_type),
-            "Team": clean(team) or "Unknown",
-            "Ownership": "Personal System",
-        }
-
+    def build_prompt(configuration, team_key):
         work_description = team_work.get(team_key, generic_work)
 
-        prompt = f"""
+        return f"""
         {base_requirements}
 
         EMPLOYEE TEAM AND WORK:
@@ -406,74 +426,107 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
         }}
         """
 
-        failed = False
+    pending_text = (
+        "⏳ PENDING\n\n"
+        "📌 Reason: AI assessment is running in the background. "
+        "Please refresh the dashboard in a minute."
+    )
 
-        try:
-            data = ask_json(prompt)
+    # ---------- PASS 1: classify every row, start background jobs ----------
+    cache = load_cache()
+    plan = []          # ("final", text) or ("key", key)
+    started = {}
 
-            decision = str(data.get("decision", "")).strip().upper()
+    for cpu, ram, storage, internet, system_type, team, owner in zip(
+        cpus, rams, storages, nets, sys_types, teams, system_owners
+    ):
+        owner_key = clean(owner).lower()
+        team_key = clean(team).upper()
 
-            if decision == "APPROVED":
-                result = "Approved"
-
-            elif decision in ("NOT SUITABLE", "MANUAL REVIEW"):
-                reason = str(data.get("reason", "")).strip()
-                impact = str(data.get("impact", "")).strip()
-                upgrades = str(data.get("upgrades", "")).strip()
-                cost = str(data.get("estimated_cost", "")).strip()
-                missing = str(data.get("missing_information", "")).strip()
-
-                icon = "❌" if decision == "NOT SUITABLE" else "⚠️"
-                team_label = clean(team) or "Unknown"
-
-                parts = [
-                    icon + " " + decision + " - Team: " + team_label,
-                    "",
-                    "📌 Reason: " + (reason or "AI did not provide a reason."),
-                    "💼 Work Impact: " + (impact or "Impact needs verification."),
-                    "🔧 Recommended Upgrade: " + (upgrades or "Needs assessment."),
-                    "💰 Approx Cost: " + (cost or "Cannot estimate"),
-                ]
-
-                if missing and missing.lower() not in ("none", "n/a"):
-                    parts.append("🔍 Please Verify: " + missing)
-
-                result = "\n".join(parts)
-
-            else:
-                failed = True
-                result = (
-                    "⚠️ MANUAL REVIEW\n\n"
-                    "📌 Reason: AI returned an invalid decision. "
-                    "Please verify the configuration manually."
-                )
-
-        except TimeoutError:
-            # Budget ran out mid-loop: not an error, just try again next refresh
-            output.append(pending_text)
+        # Company system: always approved, no AI call
+        if owner_key == "company system":
+            plan.append(("final", "Approved"))
             continue
 
-        except Exception as exc:
-            print("AI ERROR:", repr(exc))
-            failed = True
-            result = (
-                "⚠️ MANUAL REVIEW\n\n"
-                "📌 Reason: AI assessment failed (temporary). "
-                "Refresh the dashboard to retry."
+        # Unknown owner value: never silently approve
+        if owner_key != "personal system":
+            plan.append(
+                (
+                    "final",
+                    "⚠️ MANUAL REVIEW\n\n"
+                    "📌 Reason: System type (Personal/Company) is missing or invalid.",
+                )
             )
+            continue
 
-        # Keep line breaks, but clean extra spaces and pipe characters per line
-        result = "\n".join(
-            " ".join(line.replace("|", "/").split()) for line in result.split("\n")
+        key = "||".join(
+            [
+                clean(cpu),
+                clean(ram),
+                clean(storage),
+                clean(internet),
+                clean(system_type),
+                team_key,
+            ]
         )
+        plan.append(("key", key))
 
-        output.append(result)
+        if key in cache:
+            continue
 
-        # Cache only successful AI answers, never failures
-        if not failed:
-            cache[key] = result
-            cache_changed = True
-            save_cache(cache)
+        with state.lock:
+            already_running = key in state.inflight
+            if not already_running:
+                state.inflight.add(key)
+
+        if already_running or key in started:
+            continue
+
+        configuration = {
+            "CPU": str(cpu),
+            "RAM": str(ram),
+            "Storage": str(storage),
+            "Internet": str(internet),
+            "System type": str(system_type),
+            "Team": clean(team) or "Unknown",
+            "Ownership": "Personal System",
+        }
+
+        prompt = build_prompt(configuration, team_key)
+        team_label = clean(team) or "Unknown"
+        started[key] = True
+
+        thread = threading.Thread(
+            target=worker,
+            args=(key, prompt, team_label),
+            daemon=True,
+        )
+        thread.start()
+
+    # ---------- Wait a short time for background jobs ----------
+    needed = {item[1] for item in plan if item[0] == "key"}
+
+    while True:
+        cache = load_cache()
+        if all(k in cache for k in needed):
+            break
+        with state.lock:
+            still_running = any(k in state.inflight for k in needed)
+        if not still_running:
+            break  # remaining jobs failed; do not wait for nothing
+        if wait_seconds > 0 and time.time() - start >= wait_seconds:
+            break
+        time.sleep(0.5)
+
+    cache = load_cache()
+
+    # ---------- PASS 2: build the output in the original row order ----------
+    output = []
+    for kind, value in plan:
+        if kind == "final":
+            output.append(value)
+        else:
+            output.append(cache.get(value, pending_text))
 
     return output
 
@@ -481,26 +534,27 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
 # --------------------------------------------------
 # 3. Deploy the function to TabPy
 # --------------------------------------------------
-tabpy_user = os.environ.get("TABPY_USER")
-tabpy_pass = os.environ.get("TABPY_PASS")
+if __name__ == "__main__":
+    tabpy_user = os.environ.get("TABPY_USER")
+    tabpy_pass = os.environ.get("TABPY_PASS")
 
-if not tabpy_user or not tabpy_pass:
-    raise RuntimeError("TABPY_USER or TABPY_PASS missing from .env")
+    if not tabpy_user or not tabpy_pass:
+        raise RuntimeError("TABPY_USER or TABPY_PASS missing from .env")
 
-if not os.environ.get("AI_API_KEY"):
-    raise RuntimeError("AI_API_KEY missing from .env")
+    if not os.environ.get("AI_API_KEY"):
+        raise RuntimeError("AI_API_KEY missing from .env")
 
-if not os.environ.get("AI_MODEL"):
-    raise RuntimeError("AI_MODEL missing from .env")
+    if not os.environ.get("AI_MODEL"):
+        raise RuntimeError("AI_MODEL missing from .env")
 
-client = Client("http://localhost:9004/")
-client.set_credentials(tabpy_user, tabpy_pass)
+    client = Client("http://localhost:9004/")
+    client.set_credentials(tabpy_user, tabpy_pass)
 
-client.deploy(
-    "check_system",
-    check_system,
-    "AI-based laptop suitability assessment by team (Personal systems only)",
-    override=True,
-)
+    client.deploy(
+        "check_system",
+        check_system,
+        "AI-based laptop suitability assessment by team (Personal systems only)",
+        override=True,
+    )
 
-print("SUCCESS: AI-based check_system endpoint deployed.")
+    print("SUCCESS: AI-based check_system endpoint deployed.")
