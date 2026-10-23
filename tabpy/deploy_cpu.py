@@ -39,20 +39,20 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
     groq_url = "https://api.groq.com/openai/v1/chat/completions"
 
     # Team-wise work profile. Edit these as per your real team work.
-   team_work = {
+    team_work = {
         "CSA": """
         Team CSA work:
         - Client/support analysis, reporting and data validation.
         - SQL queries on BigQuery, Excel/Sheets, dashboards.
         - Browser tabs, video meetings, office applications.
-        - Light Python and VS Code usage.
+        - Light Python/VS Code usage.
         """,
         "CUBE": """
         Team Cube work:
-        - Cube (semantic layer) development with Node.js and YAML/JS models.
+        - Cube (semantic layer) development, Node.js and YAML/JS models.
         - BigQuery/GCP connections, API testing.
-        - VS Code, terminals, Git.
-        - Browser tabs and video meetings.
+        - Docker containers for local Cube setup, VS Code, terminals.
+        - Browser, Postman-type tools and video meetings.
         """,
         "DATA MART": """
         Team Data Mart work:
@@ -70,7 +70,7 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
         "LLM": """
         Team LLM work:
         - AI/LLM application development, mostly via cloud APIs.
-        - Python, notebooks, embeddings, vector data, VS Code.
+        - Python, notebooks, embeddings, vector data, Docker.
         - Occasional small local model testing.
         - A dedicated GPU is needed only if large local models are
           trained or run locally; cloud GPU/API usage does not need it.
@@ -90,7 +90,7 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
         "QA": """
         Team QA work:
         - Data and application testing, test automation scripts.
-        - Multiple browsers, Selenium/Playwright style tools.
+        - Multiple browsers, Selenium/Playwright style tools, Docker.
         - BigQuery validation queries, Python, VS Code, meetings.
         """,
         "UI/UX": """
