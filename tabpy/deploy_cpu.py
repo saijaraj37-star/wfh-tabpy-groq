@@ -28,7 +28,7 @@ if os.path.isfile(ENV_FILE):
 
 
 # --------------------------------------------------
-# 2. AI-based complete system assessment
+# 2. AI-based complete system assessment (Google Gemini)
 #    Company System  -> Approved (no AI check)
 #    Personal System -> Full AI check based on team work
 # --------------------------------------------------
@@ -36,7 +36,25 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
     model = os.environ["AI_MODEL"]
     api_key = os.environ["AI_API_KEY"]
 
-    groq_url = "https://api.groq.com/openai/v1/chat/completions"
+    # Optional pause (seconds) after each real AI call, to stay under the
+    # free-tier per-minute limit. Set AI_CALL_DELAY in .env if needed.
+    try:
+        call_delay = float(os.environ.get("AI_CALL_DELAY", "0"))
+    except ValueError:
+        call_delay = 0
+
+    gemini_url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        + model
+        + ":generateContent"
+    )
+
+    system_instruction = (
+        "You are a careful IT hardware assessor. "
+        "Be practical, technically accurate and "
+        "honest about uncertainty. Never invent "
+        "hardware specifications."
+    )
 
     # Team-wise work profile. Edit these as per your real team work.
     team_work = {
@@ -152,32 +170,34 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
         for attempt in range(4):
             try:
                 response = requests.post(
-                    groq_url,
+                    gemini_url,
                     headers={
-                        "Authorization": "Bearer " + api_key,
+                        "x-goog-api-key": api_key,
                         "Content-Type": "application/json",
                     },
                     json={
-                        "model": model,
-                        "messages": [
+                        "systemInstruction": {
+                            "parts": [{"text": system_instruction}]
+                        },
+                        "contents": [
                             {
-                                "role": "system",
-                                "content": (
-                                    "You are a careful IT hardware assessor. "
-                                    "Be practical, technically accurate and "
-                                    "honest about uncertainty. Never invent "
-                                    "hardware specifications."
-                                ),
-                            },
-                            {"role": "user", "content": prompt},
+                                "role": "user",
+                                "parts": [{"text": prompt}],
+                            }
                         ],
-                        "response_format": {"type": "json_object"},
-                        "temperature": 0,
+                        "generationConfig": {
+                            "temperature": 0,
+                            "responseMimeType": "application/json",
+                        },
                     },
+                    timeout=60,
                 )
 
-                if response.status_code == 429:
-                    last_error = "Groq rate limit (429)"
+                # Rate limit (429) or temporary overload (503): wait and retry
+                if response.status_code in (429, 503):
+                    last_error = "Gemini rate limit/overload (" + str(
+                        response.status_code
+                    ) + ")"
 
                     if attempt < 3:
                         time.sleep(10 * (attempt + 1))
@@ -187,7 +207,23 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
 
                 response.raise_for_status()
 
-                content = response.json()["choices"][0]["message"]["content"]
+                body = response.json()
+                candidates = body.get("candidates") or []
+
+                if not candidates:
+                    raise RuntimeError(
+                        "Gemini returned no candidates: "
+                        + str(body.get("promptFeedback", ""))
+                    )
+
+                parts = candidates[0].get("content", {}).get("parts") or []
+                content = "".join(part.get("text", "") for part in parts)
+
+                # Safety net in case the model wraps JSON in code fences
+                content = (
+                    content.replace("```json", "").replace("```", "").strip()
+                )
+
                 return json.loads(content)
 
             except Exception as exc:
@@ -208,12 +244,12 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
 
                 if attempt == 3:
                     raise RuntimeError(
-                        "Groq request failed: " + last_error
+                        "Gemini request failed: " + last_error
                     ) from exc
 
                 time.sleep(2 * (attempt + 1))
 
-        raise RuntimeError("Groq request failed: " + str(last_error))
+        raise RuntimeError("Gemini request failed: " + str(last_error))
 
     def clean(value):
         # Tableau can send None for NULL values
@@ -356,7 +392,7 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
             result = (
                 "⚠️ MANUAL REVIEW\n\n"
                 "📌 Reason: AI assessment failed. "
-                "Check the Groq API, model and logs."
+                "Check the Gemini API key, model name and logs."
             )
 
         # Keep line breaks, but clean extra spaces and pipe characters per line
@@ -366,6 +402,9 @@ def check_system(cpus, rams, storages, nets, sys_types, teams, system_owners):
 
         cache[key] = result
         output.append(result)
+
+        if call_delay > 0:
+            time.sleep(call_delay)
 
     return output
 
